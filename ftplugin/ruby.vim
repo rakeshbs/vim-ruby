@@ -49,6 +49,7 @@ setlocal suffixesadd=.rb
 
 if exists("&ofu") && has("ruby")
   setlocal omnifunc=rubycomplete#Complete
+  setlocal completefunc=rubycomplete#Complete
 endif
 
 " To activate, :set ballooneval
