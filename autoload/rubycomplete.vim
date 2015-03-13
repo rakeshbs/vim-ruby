@@ -62,6 +62,15 @@ function! s:dprint(msg)
     endif
 endfunction
 
+function! s:GetTagsWithPrefix(prefix)
+  let tags = taglist(a:prefix)
+  return tags
+endfunction
+
+function! s:GetLinesInBuffer()
+  return getline(1, line('$'))
+endfunction
+
 function! s:GetBufferRubyModule(name, ...)
     if a:0 == 1
         let [snum,enum] = s:GetBufferRubyEntity(a:name, "module", a:1)
@@ -71,8 +80,8 @@ function! s:GetBufferRubyModule(name, ...)
     return snum . '..' . enum
 endfunction
 
-function! s:GetBufferRubyClass(name, ...)
-    if a:0 >= 1
+function! s:GetBufferRubyClass(name, ...)"{{{
+    if a:0 >= 1"}}}
         let [snum,enum] = s:GetBufferRubyEntity(a:name, "class", a:1)
     else
         let [snum,enum] = s:GetBufferRubyEntity(a:name, "class")
@@ -222,6 +231,60 @@ begin
     require 'rubygems' # let's assume this is safe...?
 rescue Exception
     #ignore?
+end
+class Snippet
+  include Comparable
+  attr_accessor :completion
+  attr_accessor :abbreviation
+  attr_accessor :type
+  attr_accessor :hint
+  attr_accessor :signature
+
+  def initialize
+    yield self if block_given?
+  end
+
+  def completion_start_with?(prefix)
+    @completion.start_with?(prefix)
+  end
+
+  def serialize
+    @completion + "####" + @abbreviation + "####" + @type + "####" + @hint + "####" + @signature
+  end
+
+  def self.deserialize(string)
+    snippet = Snippet.new
+    snippet.instance_eval do
+      @completion,@abbreviation,@type,@hint,@signature = string.split("####")
+    end
+    snippet
+  end
+
+  def <=>(other_snippet)
+    return @signature <=> other_snippet.signature
+  end
+
+  def self.serialize_snippets_with_prefix(snippets,prefix)
+    serialized = snippets.inject("") do |concat,s|
+      if prefix == "" || s.completion_start_with?(prefix)
+        concat += s.serialize + "||"
+      end
+      concat
+    end
+    serialized += "||"
+  end
+
+  def self.deserialize_snippets(snippets_string)
+    snippet_serial_collection = snippets_string.split("||")
+    snippet_serial_collection.inject([]) do |snippets,string|
+      snippets << Snippet.deserialize(string) unless string == ""
+      snippets
+    end
+  end
+
+  def print
+    puts @signature
+  end
 end
 class VimRubyCompletion
 # {{{ constants
@@ -603,6 +666,59 @@ class VimRubyCompletion
     b.get_completions base
   end
 
+  require 'socket'
+
+  def make_function_snippet(function)
+    function =~ /def\s+(.+)\s*\((.*)\)/
+    return nil if $1.nil?
+    function_name = $1
+    return function if $2.nil?
+    function_parameters = $2
+
+    parameters = function_parameters.split(',').map do |fn|
+      parameter_1,parameter_2 = fn.split(':')
+      if parameter_2.nil?
+        "<% #{parameter_1} >"
+      else
+        "#{parameter_1}:<% #{parameter_2} >"
+      end
+    end
+    {'name' => function_name +'(' + parameters.join(', ') + ')',
+     'abbr' => function_name +'(' + function_parameters +')'}
+  end
+
+  def get_tags_with_prefix(prefix)
+    tags = VIM::evaluate("s:GetTagsWithPrefix('^#{prefix}.*')")
+    return nil if tags.nil?
+    names = tags.map do |t|
+      snippet = nil
+      if t['kind'] == 'f'
+        snippet = make_function_snippet(t['cmd'])
+      end
+      if snippet.nil?
+        snippet = {'name' => t['name'], 'abbr' => t['name']}
+      end
+      snippet
+    end
+    names
+  end
+
+  def get_rubymotion_snippets(prefix,receiver,completion_type)
+    hostname = '127.0.0.1'
+    port = 2000
+    server = TCPSocket.open(hostname, port)
+    server.puts(prefix)
+    server.puts(completion_type)
+    server.puts(receiver)
+    server.puts("<<EOF>>")
+    #server.puts(declared_line)
+    completion_string = server.gets()
+    server.close
+    snippets = Snippet.deserialize_snippets(completion_string)
+    snippets.delete_at(snippets.length-1)
+    return snippets
+  end
+
   def get_completions(base)
     loading_allowed = VIM::evaluate("exists('g:rubycomplete_buffer_loading') && g:rubycomplete_buffer_loading")
     if loading_allowed.to_i == 1
@@ -612,7 +728,7 @@ class VimRubyCompletion
 
     want_gems = VIM::evaluate("get(g:, 'rubycomplete_load_gemfile')")
     load_gems unless want_gems.to_i.zero?
-    
+
 
     input = VIM::Buffer.current.line
     cpos = VIM::Window.current.cursor[1] - 1
@@ -795,26 +911,70 @@ class VimRubyCompletion
     classes = clean_sel( classes, message ) - ["VimRubyCompletion"]
     constants = clean_sel( constants, message )
 
-    valid = []
-    valid += methods.collect { |m| { :name => m.to_s, :type => 'm' } }
-    valid += variables.collect { |v| { :name => v.to_s, :type => 'v' } }
-    valid += classes.collect { |c| { :name => c.to_s, :type => 't' } }
-    valid += constants.collect { |d| { :name => d.to_s, :type => 'd' } }
-    valid.sort! { |x,y| x[:name] <=> y[:name] }
+    current_line = Vim::Buffer.current.line[0..Vim::Window.current.cursor[1] - 1]
+    use_semantic_completion = is_semantic_completion?(current_line)
 
-    outp = ""
+    rubymotion_snippets = nil
+    words_in_file = nil
+    load_ruby_motion_plugin = VIM::evaluate("exists('g:rubymotion_completion_enabled') && g:rubymotion_completion_enabled")
+    if load_ruby_motion_plugin == 1
+      if use_semantic_completion
+          rubymotion_snippets = get_rubymotion_snippets(base,receiver,'omni')
+      else
+          rubymotion_snippets = get_rubymotion_snippets(base,receiver,'keyword')
+      end
+    end
+
+    words_in_file = get_words_in_buffer() unless use_semantic_completion
+    tags_list = get_tags_with_prefix(base)
+    valid = []
+    valid += methods.collect { |m| { :name => m.to_s, :abbr => m.to_s, :type => 'm' } }
+    valid += variables.collect { |v| { :name => v.to_s, :abbr => v.to_s, :type => 'v' } }
+    valid += classes.collect { |c| { :name => c.to_s, :abbr => c.to_s, :type => 't' } }
+    valid += constants.collect { |d| { :name => d.to_s, :abbr => d.to_s, :type => 'd' } }
+    valid += words_in_file.select{|s| s.start_with?(base) }.collect { |d| { :name => d.to_s, :abbr => d.to_s, :type => 'w' } } unless words_in_file.nil?
+    valid += tags_list.collect { |t| { :name => t['name'].to_s, :abbr => t['abbr'].to_s, :type => 't' } } unless tags_list.nil?
+    valid += rubymotion_snippets.collect { |snip| { :name => snip.completion.to_s, :hint => snip.hint,
+                                           :abbr => snip.abbreviation ,:type => snip.type } } unless rubymotion_snippets.nil?
+
+    valid.sort! { |x,y| x[:name] <=> y[:name] }
 
     rg = 0..valid.length
     rg.step(150) do |x|
       stpos = 0+x
       enpos = 150+x
-      valid[stpos..enpos].each { |c| outp += "{'word':'%s','item':'%s','kind':'%s'}," % [ c[:name], c[:name], c[:type] ].map{|x|escape_vim_singlequote_string(x)} }
-      outp.sub!(/,$/, '')
-
-      VIM::command("call extend(g:rubycomplete_completions, [%s])" % outp)
-      outp = ""
+      valid[stpos..enpos].each do |c|
+        if c[:hint].nil?
+          completion = "{'word':'%s','abbr':'%s','kind':'%s'}," % [ c[:name], c[:abbr], c[:type] ].map{|x|escape_vim_singlequote_string(x)}
+        else
+          completion = "{'word':'%s','abbr':'%s','info':'%s','kind':'%s','icase':'0'}," % [ c[:name],c[:abbr], c[:hint], c[:type] ].map{|x|escape_vim_singlequote_string(x)}
+        end
+        VIM::command("call complete_add(%s)" % completion)
+      end
+      VIM::command("call complete_check()")
     end
   end
+
+
+  def is_semantic_completion?(line)
+    return true if line.to_s.strip.start_with?("def")
+    (line.length-1).downto(0) do |i|
+      char = line[i]
+      double_colon = line[i] + line[i-1] if i > 0
+      if char == "." || double_colon == "::"
+          return true
+      elsif char.match(/[^[\w\d]]/).nil? == false
+        return false
+      end
+    end
+    return false
+  end
+
+  def get_words_in_buffer
+    lines = VIM::evaluate("s:GetLinesInBuffer()").join
+    return lines.scan(/\w+/).uniq
+  end
+
 # }}} main completion code
 
 end # VimRubyCompletion
