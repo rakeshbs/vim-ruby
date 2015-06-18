@@ -710,6 +710,7 @@ class VimRubyCompletion
     server.puts(prefix)
     server.puts(completion_type)
     server.puts(receiver)
+    server.puts(get_var_type(receiver))
     server.puts("<<EOF>>")
     #server.puts(declared_line)
     completion_string = server.gets()
@@ -913,13 +914,18 @@ class VimRubyCompletion
 
     current_line = Vim::Buffer.current.line[0..Vim::Window.current.cursor[1] - 1]
     use_semantic_completion = is_semantic_completion?(current_line)
+    is_keyword_completion = is_keyword?(current_line)
 
     rubymotion_snippets = nil
     words_in_file = nil
     load_ruby_motion_plugin = VIM::evaluate("exists('g:rubymotion_completion_enabled') && g:rubymotion_completion_enabled")
     if load_ruby_motion_plugin == 1
       if use_semantic_completion
-          rubymotion_snippets = get_rubymotion_snippets(base,receiver,'omni')
+          if is_keyword_completion
+            rubymotion_snippets = get_rubymotion_snippets(base,receiver,'namespace')
+          else
+            rubymotion_snippets = get_rubymotion_snippets(base,receiver,'omni')
+          end
       else
           rubymotion_snippets = get_rubymotion_snippets(base,receiver,'keyword')
       end
@@ -955,6 +961,19 @@ class VimRubyCompletion
     end
   end
 
+
+  def is_keyword?(line)
+    (line.length-1).downto(0) do |i|
+      char = line[i]
+      double_colon = line[i] + line[i-1] if i > 0
+      if char == "."
+          return false
+      elsif double_colon == "::"
+        return true
+      end
+    end
+    return false
+  end
 
   def is_semantic_completion?(line)
     return true if line.to_s.strip.start_with?("def")
